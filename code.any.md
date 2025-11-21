@@ -121,6 +121,94 @@ Cloudflare 的服务器成千上万，有的入口（IP 地址）用的人多，
 **结论**：
 生成的列表是**实时拼装**的，筛选是基于**静态数据的数值对比**（比如速度 > 8MB/s），而不是基于实时的网络物理连通性测试。
 
+---
+在这份代码中，**“代理规则”**其实分为两个层面：
+
+1.  **客户端规则（Client-Side）**：即你把订阅导入 Clash/Singbox/Shadowrocket 后，软件如何判断哪些流量走代理，哪些直连。
+2.  **服务端规则（Server-Side）**：即流量到达 Cloudflare Worker 后，脚本如何处理这些请求（拦截或转发）。
+
+以下是详细分析：
+
+### 1. 客户端规则（最核心的规则来源）
+
+当你拉取订阅时，脚本通过调用外部的“订阅转换 API”（SubConverter），将一份**默认的远程配置文件**注入到你的订阅中。
+
+代码中的定义如下：
+```javascript
+// 这是一个 Base64 编码的字符串
+let subConfig = atob('aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0FDTDRTU1IvQUNMNFNTUi9tYXN0ZXIvQ2xhc2gvY29uZmlnL0FDTDRTU1JfT25saW5lX01pbmlfTXVsdGlNb2RlLmluaQ==');
+```
+
+**解码后的真实地址是：**
+`https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/config/ACL4SSR_Online_Mini_MultiMode.ini`
+
+#### 这份规则（ACL4SSR_Online_Mini_MultiMode）包含的内容：
+这是各种代理软件中非常经典的规则集（ACL4SSR 精简版），它的默认行为如下：
+*   **广告屏蔽**：自动拒绝常见广告域名的连接。
+*   **国内直连**：中国大陆的 IP 和域名（如 Baidu, Taobao, QQ）不走代理，直接连接。
+*   **国外代理**：Google, YouTube, Twitter 等被墙的域名自动走代理。
+*   **自动测速/故障转移**：通常会包含“自动选择”、“负载均衡”等策略组，让客户端自动选最快的节点。
+
+**如何修改？**
+你可以在 Cloudflare 的环境变量中设置 `SUBCONFIG`，填入你喜欢的其他规则（如神机规则、Lazy 规则等）的 URL，就能替换掉这个默认规则。
+
+---
+
+### 2. 服务端规则（Worker 内部的硬规则）
+
+除了客户端的规则，Worker 代码内部还硬编码了一些规则，这些规则**在 Cloudflare 服务器端生效**，你拉取订阅时无法直接看到，但它们控制着实际的连接行为。
+
+#### A. 黑名单拦截（Ban List）
+代码定义了一个 `banHosts` 数组，用于禁止访问特定的域名。
+
+```javascript
+let banHosts = [atob('c3BlZWQuY2xvdWRmbGFyZS5jb20=')];
+// 解码后是：speed.cloudflare.com
+```
+
+*   **规则含义**：如果你的客户端试图通过这个节点去访问 `speed.cloudflare.com`（通常用于测速），Worker 会直接抛出错误 `Error('黑名单关闭 TCP 出站连接...')` 并断开连接。
+*   **目的**：防止滥用，或者防止测速脚本过度消耗 Worker 的资源。
+
+#### B. SOCKS5 分流规则（后端分流）
+代码定义了 `go2Socks5s` 数组，用于决定哪些流量需要被“二次转发”给后端的 SOCKS5 代理（如果有配置的话）。
+
+```javascript
+let go2Socks5s = [
+    '*tapecontent.net',
+    '*cloudatacdn.com',
+    '*.loadshare.org',
+];
+```
+
+*   **规则含义**：如果访问的域名匹配上述通配符（主要是流媒体相关的 CDN 域名），Worker 不会直接去连接目标，而是会将流量转发给你配置的 `SOCKS5` 代理服务器。
+*   **目的**：通常用于解锁流媒体（Netflix, Disney+ 等），因为 Cloudflare 的原生 IP 往往无法解锁这些服务，需要通过家宽或原生 IP 的 SOCKS5 落地。
+
+#### C. 端口限制
+代码中定义了允许连接的端口：
+
+```javascript
+const httpPorts = ["8080", "8880", "2052", "2082", "2086", "2095"];
+let httpsPorts = ["2053", "2083", "2087", "2096", "8443"];
+```
+
+*   **规则含义**：虽然 VLESS 协议本身可以转发任意 TCP 流量，但 Cloudflare Worker 的出站连接通常受限于 Cloudflare 支持的非标准端口。
+*   **生效方式**：在生成优选 IP 列表时，脚本会倾向于使用这些端口。
+
+---
+
+### 总结
+
+当你拉取订阅时，自动生效的规则体系如下：
+
+| 规则类型 | 来源 | 生效位置 | 默认配置 (解码后) | 作用 |
+| :--- | :--- | :--- | :--- | :--- |
+| **分流规则** | `subConfig` 变量 | **你的手机/电脑** | `ACL4SSR_Online_Mini_MultiMode.ini` | 决定访问百度直连，访问谷歌走代理，拦截广告。 |
+| **拦截规则** | `banHosts` 变量 | **Cloudflare服务器** | 禁止访问 `speed.cloudflare.com` | 防止服务器端测速滥用。 |
+| **路由规则** | `go2Socks5s` 变量 | **Cloudflare服务器** | `*tapecontent.net` 等流媒体域名 | 遇到这些域名强制走 SOCKS5 后端（如果配置了），用于流媒体解锁。 |
+
+**通俗理解**：
+*   **ACL4SSR** 规则就像是你的**导航软件**，告诉你哪条路该怎么走。
+*   **Worker 内部规则** 就像是**路障和关卡**，即使导航让你走，如果服务器端设有路障（黑名单），你也过不去。
 
 ---
 这份代码是一个部署在 **Cloudflare Workers** 或 **Cloudflare Pages** 上的脚本，主要用于搭建 **VLESS 协议** 的代理节点（EdgeTunnel）。它集成了订阅管理、在线配置、节点优选、SOCKS5/HTTP 转发等多种功能。
